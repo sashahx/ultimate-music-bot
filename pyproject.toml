@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "ultimate-music-bot"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "ultimate_music_bot"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+discord-py = {extras = ["voice"], version = "^2.3.1"}
+yt-dlp = "^2023.7.6"
+redis = "^4.6.0"
+sqlalchemy = "^2.0.19"
+psycopg2-binary = "^2.9.6"
+boto3 = "^1.28.16"
+pre-commit = "^3.3.3"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
