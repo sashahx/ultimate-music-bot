@@ -19,4 +19,5 @@ class Song(Base):  # type: ignore[valid-type, misc]
     playlist_id = db.Column(db.Integer, db.ForeignKey("playlists.id"))
     title = db.Column(db.String, nullable=False)
     url = db.Column(db.String, nullable=False)
+    s3_bucket_uuid = db.Column(db.String, nullable=True)
     playlist = relationship("Playlist", back_populates="songs")

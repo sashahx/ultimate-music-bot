@@ -13,7 +13,7 @@ def get_secret_value(secret_name: str) -> Optional[str]:
     session = boto3.session.Session()
     client = session.client(
         service_name="secretsmanager",
-        region_name="eu-north-1",
+        region_name=os.environ.get("AWS_REGION"),
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
     )
@@ -30,7 +30,7 @@ Session = sessionmaker(bind=engine)
 
 
 def add_song_to_playlist(
-    guild_id: int, playlist_name: str, title: str, url: str
+    guild_id: int, playlist_name: str, title: str, url: str, s3_bucket_uuid: str
 ) -> bool:
     with Session() as session:
         try:
@@ -44,7 +44,9 @@ def add_song_to_playlist(
                 session.add(playlist)
                 session.commit()
 
-            song = Song(title=title, url=url, playlist=playlist)
+            song = Song(
+                title=title, url=url, playlist=playlist, s3_bucket_uuid=s3_bucket_uuid
+            )
             session.add(song)
             session.commit()
             return True
