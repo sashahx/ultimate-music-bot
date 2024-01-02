@@ -1,41 +1,20 @@
-import asyncio
-import io
 import json
-import os
-import uuid
-from contextlib import redirect_stdout
-from typing import Tuple
 
-import boto3
 import discord
-import redis  # type: ignore[import]
 import yt_dlp
-from discord import Guild
 from discord.ext import commands, tasks
 from discord.ext.commands import Context
-from sclib.asyncio import SoundcloudAPI, get_resource
 
-from utils import (
+from playlist_handler import DefaultHandler, SoundCloudHandler, YouTubeHandler
+from playlist_utils import (
     add_song_to_playlist,
+    clear_bucket_queue,
     delete_playlist,
     get_playlists,
+    get_redis_client,
     get_secret_value,
     get_tracks_of_playlist,
-)
-
-YOUTUBE_URL = "youtube.com"
-SOUNDCLOUD_URL = "soundcloud.com"
-ytdl_format_options = {
-    "outtmpl": "-",
-    "logtostderr": True,
-    "noplaylist": True,
-    "format": "bestaudio/best",
-}
-
-redis_client = redis.StrictRedis(
-    port=get_secret_value("elsasticache-redis-port"),
-    host=get_secret_value("elsasticache-redis-host"),
-    db=0,
+    play_from_queue,
 )
 
 intents = discord.Intents.default()
@@ -43,77 +22,10 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 
-def get_s3_song_url(uuid: str) -> str:
-    return f"https://{get_secret_value('song-bucket')}.s3.{os.environ.get('AWS_REGION')}.amazonaws.com/{uuid}"
-
-
-def clear_bucket_queue(prefix: str) -> None:
-    s3_client = boto3.client("s3")
-    objects_to_delete = s3_client.list_objects(
-        Bucket=get_secret_value("song-bucket"), Prefix=prefix
-    )
-
-    for obj in objects_to_delete.get("Contents", []):
-        s3_client.delete_object(Bucket=get_secret_value("song-bucket"), Key=obj["Key"])
-
-
-async def download_youtube_song(
-    url: str, guild_name: str, subdirectory: str
-) -> Tuple[str, str]:
-    song_bytes = io.BytesIO()
-    with redirect_stdout(song_bytes), yt_dlp.YoutubeDL(ytdl_format_options) as ytdl:  # type: ignore[type-var]
-        info_dict = ytdl.extract_info(url, download=False)
-        title = info_dict.get("title", "Unknown Title")
-        ytdl.download([url])
-
-    bucket_key = f"{guild_name}/{subdirectory}/{uuid.uuid4()}"
-    s3_client = boto3.client("s3")
-    s3_client.put_object(
-        Body=song_bytes.getvalue(),
-        Bucket=get_secret_value("song-bucket"),
-        Key=bucket_key,
-    )
-    return (bucket_key, title)
-
-
-async def download_soundcloud_song(
-    url: str, guild_name: str, subdirectory: str
-) -> Tuple[str, str]:
-    soundcloud_api = SoundcloudAPI()
-    s3_client = boto3.client("s3")
-
-    response = await soundcloud_api.resolve(url)
-    stream_url = await response.get_stream_url()
-    song_bytes = await get_resource(stream_url)
-    bucket_key = f"{guild_name}/{subdirectory}/{uuid.uuid4()}"
-    s3_client.put_object(
-        Body=song_bytes, Bucket=get_secret_value("song-bucket"), Key=bucket_key
-    )
-    song_title = response.title
-    return (bucket_key, song_title)
-
-
-async def play_from_queue(guild: Guild) -> None:
-    voice_channel = guild.voice_client
-    guild_name = str(guild)
-    while redis_client.llen(guild_name) > 0:
-        song_info = redis_client.lpop(guild_name)
-        song_uuid, _ = json.loads(song_info.decode())
-        voice_channel.play(
-            discord.FFmpegPCMAudio(get_s3_song_url(song_uuid), executable="ffmpeg")
-        )
-        while (
-            voice_channel.is_playing()
-            or redis_client.hget("is_paused", guild_name).decode() == "paused"
-        ):
-            await asyncio.sleep(1)
-
-    clear_bucket_queue(f"{guild_name}/queue")
-
-
 @bot.command(name="stop")  # type: ignore[misc]
 async def stop(context: Context) -> None:
     voice_channel = context.guild.voice_client
+    redis_client = get_redis_client()
     if voice_channel.is_playing() or redis_client.llen(str(context.guild)) > 0:
         redis_client.ltrim(str(context.guild), 1, 0)
         redis_client.hset("is_paused", str(context.guild), "not_paused")
@@ -126,6 +38,7 @@ async def stop(context: Context) -> None:
 @bot.command(name="skip")  # type: ignore[misc]
 async def skip(context: Context) -> None:
     voice_channel = context.guild.voice_client
+    redis_client = get_redis_client()
     if redis_client.llen(str(context.guild)) > 0 or (
         voice_channel and voice_channel.is_playing()
     ):
@@ -138,6 +51,7 @@ async def skip(context: Context) -> None:
 
 @tasks.loop(minutes=1)  # type: ignore[misc]
 async def check_voice_channels() -> None:
+    redis_client = get_redis_client()
     for voice_channel in bot.voice_clients:
         if len(voice_channel.channel.members) == 1:
             redis_client.ltrim(voice_channel.guild.name, 1, 0)
@@ -154,6 +68,7 @@ async def check_voice_channels() -> None:
 @bot.command(name="pause")  # type: ignore[misc]
 async def pause(context: Context) -> None:
     voice_channel = context.guild.voice_client
+    redis_client = get_redis_client()
     if voice_channel.is_playing():
         redis_client.hset("is_paused", str(context.guild), "paused")
 
@@ -166,57 +81,13 @@ async def pause(context: Context) -> None:
 @bot.command(name="resume")  # type: ignore[misc]
 async def resume(context: Context) -> None:
     voice_channel = context.guild.voice_client
+    redis_client = get_redis_client()
     if voice_channel.is_paused():
         redis_client.hset("is_paused", str(context.guild), "not_paused")
-
         voice_channel.resume()
         await context.send("Music resumed.")
     else:
         await context.send("Music is not paused.")
-
-
-@bot.command(name="add_song_to_playlist")  # type: ignore[misc]
-async def add_song_to_playlist_command(
-    context: Context, playlist_name: str, song_url: str
-) -> None:
-    if YOUTUBE_URL in playlist_name:
-        await context.send(
-            f"Using {YOUTUBE_URL} as part of a playlist name is not allowed"
-        )
-    elif SOUNDCLOUD_URL in playlist_name:
-        await context.send(
-            f"Using {SOUNDCLOUD_URL} as part of a playlist name is not allowed"
-        )
-    else:
-        bucket_key = None
-        if YOUTUBE_URL in song_url:
-            bucket_key, song_title = await download_youtube_song(
-                song_url, str(context.guild), playlist_name
-            )
-        elif SOUNDCLOUD_URL in song_url:
-            bucket_key, song_title = await download_soundcloud_song(
-                song_url, str(context.guild), playlist_name
-            )
-
-        if bucket_key is not None:
-            added_successfully = add_song_to_playlist(
-                guild_id=context.guild.id,
-                playlist_name=playlist_name,
-                title=song_title,
-                url=song_url,
-                s3_bucket_uuid=bucket_key,
-            )
-
-            if added_successfully:
-                await context.send(
-                    f"Song '{song_title}' added to playlist '{playlist_name}'"
-                )
-            else:
-                await context.send(
-                    f"Failed to add the song to playlist '{playlist_name}'. Please try again later"
-                )
-        else:
-            await context.send("Failed to download the track")
 
 
 @bot.command(name="delete_playlist")  # type: ignore[misc]
@@ -262,27 +133,52 @@ async def get_tracks_of_playlist_command(context: Context, playlist_name: str) -
         await context.send("Failed to get tracks. Please try again later")
 
 
+@bot.command(name="add_song_to_playlist")  # type: ignore[misc]
+async def add_song_to_playlist_command(
+    context: Context, playlist_name: str, song_url: str
+) -> None:
+    handler_chain = YouTubeHandler(SoundCloudHandler(DefaultHandler()))
+    bucket_key, song_title = await handler_chain.handle_request(
+        context, playlist_name, song_url
+    )
+
+    if bucket_key is not None and song_title is not None:
+        added_successfully = add_song_to_playlist(
+            guild_id=context.guild.id,
+            playlist_name=playlist_name,
+            title=song_title,
+            url=song_url,
+            s3_bucket_uuid=bucket_key,
+        )
+
+        if added_successfully:
+            await context.send(
+                f"Song '{song_title}' added to playlist '{playlist_name}'"
+            )
+        else:
+            await context.send(
+                f"Failed to add the song to playlist '{playlist_name}'. Please try again later"
+            )
+    else:
+        await context.send("Failed to download the track")
+
+
 @bot.command(name="play")  # type: ignore[misc]
 async def play(context: Context, url_or_playlist: str) -> None:
+    redis_client = get_redis_client()
     if context.guild.voice_client not in bot.voice_clients:
         await context.message.author.voice.channel.connect()
         redis_client.hset("is_paused", str(context.guild), "not_paused")
 
     voice_channel = context.message.guild.voice_client
     guild_name = str(context.guild)
-
+    handler_chain = YouTubeHandler(SoundCloudHandler(DefaultHandler()))
     try:
-        if YOUTUBE_URL in url_or_playlist:
-            bucket_uuid, song_title = await download_youtube_song(
-                url_or_playlist, guild_name, "queue"
-            )
-            redis_client.rpush(guild_name, json.dumps([bucket_uuid, song_title]))
-            async with context.typing():
-                await context.send(f"{song_title} added to queue")
-        elif SOUNDCLOUD_URL in url_or_playlist:
-            bucket_uuid, song_title = await download_soundcloud_song(
-                url_or_playlist, guild_name, "queue"
-            )
+        bucket_uuid, song_title = await handler_chain.handle_request(
+            context, "queue", url_or_playlist
+        )
+
+        if bucket_uuid is not None:
             redis_client.rpush(guild_name, json.dumps([bucket_uuid, song_title]))
             async with context.typing():
                 await context.send(f"{song_title} added to queue")
@@ -302,6 +198,7 @@ async def play(context: Context, url_or_playlist: str) -> None:
 
         if not voice_channel.is_playing():
             await play_from_queue(context.guild)
+
     except yt_dlp.utils.DownloadError:
         await context.send(
             "Couldn't download a song, it looks like your link is broken"
